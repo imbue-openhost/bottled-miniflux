@@ -9,12 +9,13 @@ port = 8080
 
 [routing]
 health_check = "/healthcheck"
-# Only the health-check endpoint is exposed unauthenticated so the OpenHost
-# router can probe liveness. Every other path goes through the container's
-# auth-proxy sidecar which enforces the zone_auth cookie before forwarding
-# to Miniflux. Miniflux itself listens on loopback inside the container so
-# traffic from outside the container cannot bypass the sidecar.
-public_paths = ["/healthcheck"]
+# /healthcheck is exposed unauthenticated so the OpenHost router can probe
+# liveness. /js/ is public so the browser can register the Miniflux service
+# worker without hitting the OpenHost auth redirect (browsers reject service
+# worker scripts served behind a redirect). All other paths go through the
+# container's auth-proxy sidecar which enforces the zone_auth cookie before
+# forwarding to Miniflux.
+public_paths = ["/healthcheck", "/js/"]
 
 [resources]
 memory_mb = 512
