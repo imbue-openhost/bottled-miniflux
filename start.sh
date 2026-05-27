@@ -155,7 +155,7 @@ if ! kill -0 "$MINIFLUX_PID" 2>/dev/null; then
 fi
 
 echo "[start.sh] Starting auth-proxy on 0.0.0.0:8080"
-/opt/auth-venv/bin/python3 /app/auth_proxy.py &
+python3 /app/auth_proxy.py &
 PROXY_PID=$!
 
 # Forward SIGTERM / SIGINT to both children so the container stops cleanly.
