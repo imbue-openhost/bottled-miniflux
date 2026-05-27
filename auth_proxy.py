@@ -1,26 +1,27 @@
 """OpenHost auth proxy sidecar for Miniflux.
 
-Sits between the OpenHost router and Miniflux. Verifies the visitor's
-`zone_auth` JWT cookie (signed by the OpenHost router with RS256, published
-at /.well-known/jwks.json on the router) and, when the claim `sub == "owner"`,
-stamps an `X-Openhost-User: admin` header on the proxied request.
+Sits between the OpenHost router and Miniflux. Checks the
+``X-OpenHost-Is-Owner`` header set by the OpenHost router on authenticated
+owner requests and, when present and true, stamps an
+``X-Openhost-User: admin`` header on the proxied request.
 
 Miniflux is configured with AUTH_PROXY_HEADER=X-Openhost-User, so a valid
-stamped header authenticates the owner as the `admin` Miniflux user. On the
+stamped header authenticates the owner as the ``admin`` Miniflux user. On the
 first such request, Miniflux auto-creates the admin account
 (AUTH_PROXY_USER_CREATION=1). DISABLE_LOCAL_AUTH=1 hides the password form.
 
-Why not trust `X-OpenHost-Is-Owner`? The OpenHost router passes client-supplied
-headers through to apps on public paths and overwrites X-OpenHost-Is-Owner only
-for authenticated owners. Non-owner visitors to a public path (Miniflux's
-`/healthcheck` is listed in `openhost.toml`'s `public_paths`) could forge the
-header. We mirror the mirotalk pattern — verify a signed JWT ourselves — so the
-app stays safe regardless of which paths are public.
+The OpenHost router sets ``X-OpenHost-Is-Owner: true`` only for authenticated
+owners after verifying their session. On non-public paths (which is everything
+except ``/healthcheck`` and ``/js/`` for this app) the router enforces auth
+before the request reaches the container, so a forged header from an
+unauthenticated client never arrives here.
 
-We deliberately strip any incoming X-Openhost-User header on every request so
-that a hostile upstream or client cannot inject auth by setting it themselves.
-Miniflux's TRUSTED_REVERSE_PROXY_NETWORKS is also set to 127.0.0.1/32 so only
-this sidecar's stamped header is honored.
+We deliberately strip both ``X-OpenHost-Is-Owner`` and ``X-Openhost-User``
+from every proxied request so that (a) the router's internal header doesn't
+leak to Miniflux and (b) a hostile client cannot inject auth by setting the
+Miniflux proxy-auth header themselves. Miniflux's
+TRUSTED_REVERSE_PROXY_NETWORKS is also set to 127.0.0.1/32 so only this
+sidecar's stamped header is honored.
 """
 
 from __future__ import annotations
@@ -30,18 +31,11 @@ import logging
 import os
 import socket
 import sys
-import threading
-import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import AbstractSet, Iterable
 
-import jwt
-import requests
-
 AUTH_HEADER_NAME = "X-Openhost-User"
-ZONE_COOKIE = "zone_auth"
-JWKS_PATH = "/.well-known/jwks.json"
-JWKS_REFRESH_INTERVAL_SEC = 600  # 10 minutes
+OWNER_HEADER_NAME = "X-OpenHost-Is-Owner"
 # Headers that must not be forwarded hop-by-hop (RFC 7230 §6.1) plus a few
 # extras where we control the forwarding meaning.
 HOP_BY_HOP_HEADERS = frozenset(
@@ -67,160 +61,6 @@ logging.basicConfig(
 log = logging.getLogger("auth_proxy")
 
 
-class JwksCache:
-    """Fetches the OpenHost router's JWKS and caches it with stale fallback.
-
-    Mirrors the pattern used by openhost-mirotalk-p2p/openhost-shim.js: on
-    a successful fetch the keys are cached for JWKS_REFRESH_INTERVAL_SEC; on
-    a failed refresh we keep serving the previously-cached keys rather than
-    failing closed, so a transient router outage doesn't lock the owner out.
-    """
-
-    def __init__(self, router_url: str) -> None:
-        self._router_url = router_url.rstrip("/")
-        self._keys: list = []
-        self._fetched_at: float = 0.0
-        # `_cache_lock` guards reads/writes of _keys and _fetched_at. It is
-        # only ever held briefly — never across the blocking HTTP fetch.
-        self._cache_lock = threading.Lock()
-        # `_fetch_lock` serialises the HTTP fetch itself so only one thread
-        # at a time calls the router while others keep serving cached keys.
-        self._fetch_lock = threading.Lock()
-
-    def _fetch(self) -> list:
-        url = f"{self._router_url}{JWKS_PATH}"
-        # Use a context manager so the underlying connection is released on
-        # every exit path (success, HTTPError from raise_for_status, JSON
-        # decode error, etc.).
-        with requests.get(url, timeout=5) as resp:
-            resp.raise_for_status()
-            jwks = resp.json()
-        keys = []
-        skipped = 0
-        for jwk in jwks.get("keys", []):
-            # Parse each JWK individually. If the router ever publishes a
-            # key type we don't handle (e.g. an EC key alongside RSA during
-            # a future rotation), or a key with a missing field, we log and
-            # skip that one entry rather than discarding the whole set and
-            # locking the owner out.
-            try:
-                key = jwt.algorithms.RSAAlgorithm.from_jwk(jwk)
-            except Exception as exc:  # noqa: BLE001
-                skipped += 1
-                kid = jwk.get("kid") if isinstance(jwk, dict) else None
-                log.warning("skipping malformed JWK (kid=%s): %s", kid, exc)
-                continue
-            keys.append(key)
-        if not keys:
-            raise RuntimeError(
-                f"router JWKS contains no usable keys (skipped {skipped})"
-            )
-        return keys
-
-    def get(self) -> list:
-        # Fast path: return cached keys without touching either lock beyond
-        # the brief snapshot read.
-        with self._cache_lock:
-            cached_keys = self._keys
-            cached_at = self._fetched_at
-        if cached_keys and (time.time() - cached_at) < JWKS_REFRESH_INTERVAL_SEC:
-            return cached_keys
-
-        # Serialise refreshes across threads so we only fetch once even under
-        # concurrent bursts. Other threads block only on this lock, not on
-        # the network I/O directly.
-        with self._fetch_lock:
-            # Another thread may have refreshed while we waited.
-            with self._cache_lock:
-                cached_keys = self._keys
-                cached_at = self._fetched_at
-            if cached_keys and (time.time() - cached_at) < JWKS_REFRESH_INTERVAL_SEC:
-                return cached_keys
-
-            try:
-                keys = self._fetch()
-            except Exception as exc:  # noqa: BLE001 - log+fallback
-                if cached_keys:
-                    log.warning(
-                        "JWKS refresh failed, using cached keys: %s", exc
-                    )
-                    return cached_keys
-                log.warning("JWKS fetch failed and no cache: %s", exc)
-                raise
-
-            with self._cache_lock:
-                self._keys = keys
-                self._fetched_at = time.time()
-            log.info("refreshed JWKS (%d key(s))", len(keys))
-            return keys
-
-    def prefetch(self) -> None:
-        try:
-            self.get()
-        except Exception as exc:  # noqa: BLE001
-            log.warning("initial JWKS prefetch failed (will retry on demand): %s", exc)
-
-
-def _parse_cookie_header(cookie_header: str | None) -> dict[str, str]:
-    """Parse an RFC6265 Cookie header into a {name: value} dict.
-
-    Uses first-value-wins semantics for duplicate cookie names. Browsers
-    send most-specific-path / most-specific-domain cookies first, so the
-    first occurrence is what the site "meant" to set. This also prevents a
-    trivial denial-of-service where a hostile client appends a duplicate
-    `zone_auth=garbage` after the real cookie to make us reject an
-    otherwise valid owner token.
-
-    Purposefully lenient on encoding: JWT values only contain URL-safe
-    base64 characters + two dots so decoding is a no-op in practice.
-    """
-    if not cookie_header:
-        return {}
-    result: dict[str, str] = {}
-    for part in cookie_header.split(";"):
-        if "=" not in part:
-            continue
-        name, value = part.split("=", 1)
-        result.setdefault(name.strip(), value.strip())
-    return result
-
-
-def _verify_owner(token: str, jwks: JwksCache) -> bool:
-    """Return True if the JWT is a valid router-signed owner token."""
-    if not token:
-        return False
-    try:
-        keys = jwks.get()
-    except Exception as exc:  # noqa: BLE001
-        # No keys available and nothing cached. Fail closed, but surface the
-        # reason so an operator investigating "I can't log in" has a trail.
-        log.warning("JWKS unavailable; denying owner check: %s", exc)
-        return False
-
-    # Try each key; RS256 verification, require exp claim, no audience check
-    # (the router doesn't set aud). If any key verifies and the subject is
-    # "owner", accept. We continue the loop on both invalid-signature errors
-    # and successful-but-non-owner decodes so a JWKS rollover (old key still
-    # present while the new one takes over) can't accidentally stop
-    # accepting legitimate owner tokens.
-    for key in keys:
-        try:
-            claims = jwt.decode(
-                token,
-                key,
-                algorithms=["RS256"],
-                options={
-                    "require": ["exp"],
-                    "verify_aud": False,
-                },
-            )
-        except jwt.PyJWTError:
-            continue
-        if claims.get("sub") == "owner":
-            return True
-    return False
-
-
 def _strip_headers(
     headers: Iterable[tuple[str, str]], drop: AbstractSet[str]
 ) -> list[tuple[str, str]]:
@@ -229,11 +69,6 @@ def _strip_headers(
 
 
 class AuthProxyHandler(BaseHTTPRequestHandler):
-    # `jwks` is set by main() before the server is started. The ClassVar
-    # default of None guards against construction order bugs (e.g. a test
-    # that instantiates the handler without running main()): a clear
-    # RuntimeError is friendlier than an AttributeError at request time.
-    jwks: JwksCache | None = None
     miniflux_host: str = "127.0.0.1"
     miniflux_port: int = 8081
 
@@ -300,29 +135,19 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
             # Very unlikely (socket already closed); nothing to recover.
             pass
 
+        # Check the router-set owner header before stripping it.
+        is_owner = self.headers.get(OWNER_HEADER_NAME, "").lower() == "true"
 
-        # Strip (a) the auth header (never trust client-supplied), (b)
-        # hop-by-hop headers (Connection, Transfer-Encoding, etc.), and (c)
+        # Strip (a) the owner header (internal to the proxy, don't leak to
+        # Miniflux), (b) the auth header (never trust client-supplied), (c)
+        # hop-by-hop headers (Connection, Transfer-Encoding, etc.), and (d)
         # Content-Length — we rebuild the body into a buffered request below
         # and set a fresh Content-Length from the actual bytes we send.
-        # Forwarding the client's Content-Length or Transfer-Encoding would
-        # confuse the upstream when the two disagree.
         cleaned_headers = _strip_headers(
             self.headers.items(),
-            HOP_BY_HOP_HEADERS | {AUTH_HEADER_NAME.lower(), "content-length"},
+            HOP_BY_HOP_HEADERS | {AUTH_HEADER_NAME.lower(), OWNER_HEADER_NAME.lower(), "content-length"},
         )
 
-        # Decide whether this request carries an owner's signed cookie. The
-        # jwks class attribute should always be set by main() before the
-        # server accepts requests; if not, fail closed rather than letting
-        # a None deref crash the handler.
-        if self.jwks is None:
-            log.error("auth-proxy JWKS not initialised; refusing request")
-            self._safe_send_error(503, "auth-proxy not initialised")
-            return
-        cookies = _parse_cookie_header(self.headers.get("Cookie"))
-        token = cookies.get(ZONE_COOKIE, "")
-        is_owner = _verify_owner(token, self.jwks)
         if is_owner:
             cleaned_headers.append((AUTH_HEADER_NAME, "admin"))
 
@@ -514,11 +339,6 @@ def _port_from_env(name: str, default: int) -> int:
 
 
 def main() -> int:
-    router_url = os.environ.get("OPENHOST_ROUTER_URL", "").strip()
-    if not router_url:
-        log.error("OPENHOST_ROUTER_URL is not set; refusing to start")
-        return 1
-
     try:
         listen_port = _port_from_env("AUTH_PROXY_LISTEN_PORT", 8080)
         miniflux_port = _port_from_env("MINIFLUX_UPSTREAM_PORT", 8081)
@@ -526,18 +346,11 @@ def main() -> int:
         log.error("invalid port configuration: %s", exc)
         return 1
 
-    jwks = JwksCache(router_url)
-    jwks.prefetch()
-
-    AuthProxyHandler.jwks = jwks
     AuthProxyHandler.miniflux_port = miniflux_port
 
     try:
         server = IPv4ThreadingServer(("0.0.0.0", listen_port), AuthProxyHandler)
     except OSError as exc:
-        # Typically "address already in use" if something else is already
-        # bound. Fail with a clear message instead of a raw traceback so
-        # the operator can see what's wrong in the container logs.
         log.error(
             "failed to bind auth-proxy listener on 0.0.0.0:%d: %s",
             listen_port,
@@ -545,10 +358,9 @@ def main() -> int:
         )
         return 1
     log.info(
-        "listening on 0.0.0.0:%d -> 127.0.0.1:%d (router=%s)",
+        "listening on 0.0.0.0:%d -> 127.0.0.1:%d",
         listen_port,
         miniflux_port,
-        router_url,
     )
     try:
         server.serve_forever()
