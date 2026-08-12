@@ -1,9 +1,9 @@
-Miniflux minimalist RSS reader for OpenHost. Runs as a single Docker container with PostgreSQL bundled inside and OpenHost single sign-on.
+Miniflux minimalist RSS reader for Cloud in a Bottle. Runs as a single Docker container with PostgreSQL bundled inside and Cloud in a Bottle single sign-on.
 
 ## How it works
 
 On first boot, the container:
-1. Initializes a PostgreSQL database in OpenHost persistent storage.
+1. Initializes a PostgreSQL database in Cloud in a Bottle persistent storage.
 2. Creates the `miniflux` database with the `hstore` extension.
 3. Runs Miniflux migrations.
 4. Starts Miniflux on `127.0.0.1:8081` behind a tiny auth-proxy sidecar on port 8080.
@@ -11,7 +11,7 @@ On first boot, the container:
 
 ## Authentication
 
-Miniflux does not have its own login flow here — sign-in is handled by the zone's OpenHost identity.
+Miniflux does not have its own login flow here — sign-in is handled by the zone's Cloud in a Bottle identity.
 
 The auth-proxy sidecar (`auth_proxy.py`) verifies the visitor's `zone_auth` JWT cookie against the router's JWKS at `$OPENHOST_ROUTER_URL/.well-known/jwks.json`. When the cookie is a valid RS256 token with `sub == "owner"`, the sidecar stamps the request with `X-Openhost-User: admin` and forwards it to Miniflux. Miniflux is configured with `AUTH_PROXY_HEADER=X-Openhost-User`, `AUTH_PROXY_USER_CREATION=1`, `TRUSTED_REVERSE_PROXY_NETWORKS=127.0.0.1/32`, and `DISABLE_LOCAL_AUTH=1`, so:
 
@@ -20,12 +20,12 @@ The auth-proxy sidecar (`auth_proxy.py`) verifies the visitor's `zone_auth` JWT 
 - Only requests from 127.0.0.1 (the sidecar) are trusted to assert the user header.
 - Any client-supplied `X-Openhost-User` header is stripped before it can reach Miniflux, so header injection cannot grant access.
 
-The sidecar caches the JWKS for 10 minutes and falls back to the cached copy on router outages (matching the pattern in `openhost-mirotalk-p2p`).
+The sidecar caches the JWKS for 10 minutes and falls back to the cached copy on router outages (matching the pattern in `bottled-mirotalk-p2p`).
 
 ## Deploying
 
 ```bash
-oh app deploy https://github.com/imbue-openhost/openhost-miniflux --wait
+oh app deploy https://github.com/imbue-openhost/bottled-miniflux --wait
 ```
 
 The app will be available at `miniflux.{zone_domain}`. Browse to it and you're signed in — no separate password.
@@ -78,6 +78,6 @@ pytest tests/ -q
 ## Files
 
 - `Dockerfile` — multi-stage build: extracts Miniflux binary, adds PostgreSQL and a Python venv with `PyJWT[crypto]` + `requests` on Alpine.
-- `start.sh` — initializes PostgreSQL, configures Miniflux via env vars, starts Miniflux on loopback, then starts the auth-proxy sidecar; supervises both so the container exits (and is restarted by OpenHost) if either child dies.
-- `auth_proxy.py` — the JWT-verifying reverse proxy that translates OpenHost SSO into Miniflux's auth-proxy header.
-- `openhost.toml` — OpenHost app manifest. Only `/healthcheck` is marked as a public path.
+- `start.sh` — initializes PostgreSQL, configures Miniflux via env vars, starts Miniflux on loopback, then starts the auth-proxy sidecar; supervises both so the container exits (and is restarted by Cloud in a Bottle) if either child dies.
+- `auth_proxy.py` — the JWT-verifying reverse proxy that translates Cloud in a Bottle SSO into Miniflux's auth-proxy header.
+- `openhost.toml` — Cloud in a Bottle app manifest. Only `/healthcheck` is marked as a public path.
