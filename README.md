@@ -13,14 +13,14 @@ On first boot, the container:
 
 Miniflux does not have its own login flow here — sign-in is handled by the zone's Cloud in a Bottle identity.
 
-The auth-proxy sidecar (`auth_proxy.py`) verifies the visitor's `zone_auth` JWT cookie against the router's JWKS at `$OPENHOST_ROUTER_URL/.well-known/jwks.json`. When the cookie is a valid RS256 token with `sub == "owner"`, the sidecar stamps the request with `X-Openhost-User: admin` and forwards it to Miniflux. Miniflux is configured with `AUTH_PROXY_HEADER=X-Openhost-User`, `AUTH_PROXY_USER_CREATION=1`, `TRUSTED_REVERSE_PROXY_NETWORKS=127.0.0.1/32`, and `DISABLE_LOCAL_AUTH=1`, so:
+The Cloud in a Bottle router authenticates the visitor and, on requests from the zone owner, sets a trusted `X-OpenHost-Is-Owner: true` header. The router enforces auth on every non-public path (everything except `/healthcheck` and `/js/` for this app) *before* the request reaches the container, and it strips any inbound `X-OpenHost-*` headers so a client cannot forge them.
+
+The auth-proxy sidecar (`auth_proxy.py`) reads that header. When it is `true`, the sidecar stamps the request with `X-Openhost-User: admin` and forwards it to Miniflux. Miniflux is configured with `AUTH_PROXY_HEADER=X-Openhost-User`, `AUTH_PROXY_USER_CREATION=1`, `TRUSTED_REVERSE_PROXY_NETWORKS=127.0.0.1/32`, and `DISABLE_LOCAL_AUTH=1`, so:
 
 - The zone owner is auto-logged-in as the `admin` Miniflux user on their first visit (the account is auto-created).
 - The username/password form is hidden — there is no local password to remember or leak.
 - Only requests from 127.0.0.1 (the sidecar) are trusted to assert the user header.
-- Any client-supplied `X-Openhost-User` header is stripped before it can reach Miniflux, so header injection cannot grant access.
-
-The sidecar caches the JWKS for 10 minutes and falls back to the cached copy on router outages (matching the pattern in `bottled-mirotalk-p2p`).
+- The sidecar strips both `X-OpenHost-Is-Owner` and any client-supplied `X-Openhost-User` from the request before forwarding, so neither the router's internal header nor a hostile client's injected header can reach Miniflux as-is — the only `X-Openhost-User` Miniflux ever sees is the one the sidecar stamps itself.
 
 ## Deploying
 
@@ -59,25 +59,31 @@ curl -b cookies.txt -IL https://miniflux.<zone-domain>/
 
 # Without any cookies:
 curl -IL https://miniflux.<zone-domain>/
-# Should end at the OpenHost zone's /login page.
+# Should end at the Cloud in a Bottle zone's /login page (the router gates the request).
 
 # Header spoofing attempt:
-curl -IL -H "X-Openhost-User: admin" https://miniflux.<zone-domain>/
-# Should also end at the zone login — the sidecar strips the header.
+curl -IL -H "X-OpenHost-Is-Owner: true" https://miniflux.<zone-domain>/
+# Should also end at the zone login — the router strips inbound X-OpenHost-* headers,
+# so a forged owner header never reaches the sidecar.
 ```
 
 ## Development
 
-Unit tests (pure helpers; JWT verification, cookie parsing):
+Unit tests cover the sidecar's pure helper functions (header stripping — the
+header-injection defense — and port parsing). They need only `pytest`; the
+proxy itself imports nothing outside the Python standard library.
 
 ```bash
-pip install 'PyJWT[crypto]==2.9.0' requests pytest cryptography
+pip install pytest
 pytest tests/ -q
 ```
 
+The HTTP handler's socket I/O is exercised at deploy time via the smoke-test
+commands above.
+
 ## Files
 
-- `Dockerfile` — multi-stage build: extracts Miniflux binary, adds PostgreSQL and a Python venv with `PyJWT[crypto]` + `requests` on Alpine.
+- `Dockerfile` — multi-stage build: extracts the Miniflux binary, then adds PostgreSQL and Python 3 on Alpine.
 - `start.sh` — initializes PostgreSQL, configures Miniflux via env vars, starts Miniflux on loopback, then starts the auth-proxy sidecar; supervises both so the container exits (and is restarted by Cloud in a Bottle) if either child dies.
-- `auth_proxy.py` — the JWT-verifying reverse proxy that translates Cloud in a Bottle SSO into Miniflux's auth-proxy header.
-- `openhost.toml` — Cloud in a Bottle app manifest. Only `/healthcheck` is marked as a public path.
+- `auth_proxy.py` — the reverse proxy that translates Cloud in a Bottle's `X-OpenHost-Is-Owner` signal into Miniflux's auth-proxy header.
+- `openhost.toml` — Cloud in a Bottle app manifest. Only `/healthcheck` and `/js/` are marked as public paths.
